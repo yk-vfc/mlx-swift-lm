@@ -512,10 +512,16 @@ enum Qwen3VLVision {
     /// (padded dims contribute nothing to the dot products; `scale` is passed explicitly)
     /// and dispatches the O(L)-memory fused kernel. Same trick as `gemma4EnsureFusedSDPA`
     /// and mlx-vlm's Python `ensure_fused_sdpa`.
+    ///
+    /// On GPUs with Neural Accelerators the pad goes to 96 instead: the vendored MLX
+    /// (v0.32.2) runs head dims 64/96/128/256 on its NAX attention kernel but sends 80 to
+    /// the older steel kernel, which is ~3.5x slower at vision-tower lengths on M5
+    /// (L=4800: 20.5 ms vs 5.9 ms per call, 27 calls per image). MLX v0.32.3 adds NAX for
+    /// long unmasked D72/D80 inputs (ml-explore/mlx#4455).
     fileprivate static func ensureFusedSDPA(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
     ) -> MLXArray {
-        let fusedDims = [64, 80, 128]
+        let fusedDims = naxAvailable ? [64, 96, 128] : [64, 80, 128]
         let headDim = queries.dim(queries.ndim - 1)
         let target = fusedDims.first(where: { headDim <= $0 }) ?? headDim
 
@@ -532,6 +538,20 @@ enum Qwen3VLVision {
             scale: scale, mask: .none
         )[.ellipsis, ..<headDim]
     }
+
+    /// Whether MLX dispatches its Neural Accelerator (NAX) kernels on this GPU.
+    /// Mirrors `is_nax_available()` in mlx/backend/metal/device.cpp: macOS/iOS 26.2+
+    /// and architecture generation 17+ (18+ for phone GPUs), read from the two digits
+    /// before the final letter of the name, e.g. "applegpu_g17s".
+    fileprivate static let naxAvailable: Bool = {
+        guard #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) else { return false }
+        let name = Array(GPU.deviceInfo().architecture)
+        guard name.count >= 3,
+            let tens = name[name.count - 3].wholeNumberValue,
+            let ones = name[name.count - 2].wholeNumberValue
+        else { return false }
+        return tens * 10 + ones >= (name.last == "p" ? 18 : 17)
+    }()
 
     final class VisionRotaryEmbedding {
         let dimension: Int
